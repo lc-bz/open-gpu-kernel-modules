@@ -1514,6 +1514,355 @@ unlock_priv:
     return ret;
 }
 
+static int
+nv_dma_buf_vmap_pages(
+    nv_dma_buf_file_private_t *priv,
+    pgprot_t page_prot,
+    void **vaddr
+)
+{
+    NvU32 i;
+    NvU64 range_index;
+    NvU64 page_index;
+    struct page **pages;
+    void *pgmap = NULL;
+    NvU64 total_pfn_count = priv->total_size >> PAGE_SHIFT;
+    int ret = 0;
+
+    if (!PAGE_ALIGNED(priv->total_size))
+    {
+        nv_printf(NV_DBG_ERRORS,
+                  "NVRM: nv_dma_buf_vmap_pages: priv->total_size[0x%llx] is not page aligned\n",
+                  priv->total_size);
+        return -EINVAL;
+    }
+
+    if (total_pfn_count > UINT_MAX)
+    {
+        nv_printf(NV_DBG_ERRORS,
+                  "NVRM: nv_dma_buf_vmap_pages: total_pfn_count[0x%llx] exceeds UINT_MAX\n",
+                  total_pfn_count);
+        return -EOVERFLOW;
+    }
+
+    if (os_alloc_mem((void **)&pages, total_pfn_count * sizeof(*pages)) != NV_OK)
+    {
+        nv_printf(NV_DBG_ERRORS, "NVRM: nv_dma_buf_vmap_pages: failed to allocate page array\n");
+        return -ENOMEM;
+    }
+
+    if ((priv->nv->coherent_gpu_mem_mode == NV_COHERENT_GPU_MEM_MODE_DRIVER) &&
+        (priv->map_attrs.memory_type != NV_MEMORY_TYPE_SYSTEM))
+    {
+        pgmap = nv_dma_get_dev_pagemap(priv->handles[0].memArea.pRanges[0].start);
+        if (pgmap == NULL)
+        {
+            nv_printf(NV_DBG_ERRORS,
+                      "NVRM: nv_dma_buf_vmap_pages: Failed to get a reference on dev_pagemap in CDMM(driver) mode\n");
+            ret = -EOPNOTSUPP;
+            goto free_mem;
+        }
+    }
+
+    page_index = 0;
+    for (i = 0; i < priv->num_objects; i++)
+    {
+        MemoryArea *mem_area = &priv->handles[i].memArea;
+        for (range_index = 0; range_index < mem_area->numRanges; range_index++)
+        {
+            MemoryRange range = mem_area->pRanges[range_index];
+            NvU64 addr;
+            NvU64 range_end;
+
+            if (!PAGE_ALIGNED(range.start) || !PAGE_ALIGNED(range.size))
+            {
+                nv_printf(NV_DBG_ERRORS,
+                          "NVRM: nv_dma_buf_vmap_pages: a memory range is not page aligned start[%llx] size[%llx]\n",
+                          range.start, range.size);
+                ret = -EINVAL;
+                goto put_dev_pagemap;
+            }
+
+            addr = range.start;
+            range_end = range.start + range.size;
+            for (; addr < range_end; addr += PAGE_SIZE)
+            {
+                if (page_index >= total_pfn_count)
+                {
+                    nv_printf(NV_DBG_ERRORS,
+                              "NVRM: nv_dma_buf_vmap_pages: ranges cover more than the expected %llu pages\n",
+                              total_pfn_count);
+                    ret = -EINVAL;
+                    goto put_dev_pagemap;
+                }
+
+                pages[page_index++] = NV_GET_PAGE_STRUCT(addr);
+            }
+        }
+    }
+
+    if (page_index != total_pfn_count)
+    {
+        nv_printf(NV_DBG_ERRORS,
+                  "NVRM: nv_dma_buf_vmap_pages: ranges cover %llu pages, expected %llu\n",
+                  page_index, total_pfn_count);
+        ret = -EINVAL;
+        goto put_dev_pagemap;
+    }
+
+    *vaddr = vmap(pages, total_pfn_count, VM_MAP, page_prot);
+    if (*vaddr == NULL)
+    {
+        nv_printf(NV_DBG_ERRORS, "NVRM: nv_dma_buf_vmap_pages: vmap failed\n");
+        ret = -ENOMEM;
+        goto put_dev_pagemap;
+    }
+
+put_dev_pagemap:
+    if (pgmap != NULL)
+    {
+        nv_dma_put_dev_pagemap(pgmap);
+    }
+
+free_mem:
+    os_free_mem(pages);
+    return ret;
+}
+
+#if NV_IS_EXPORT_SYMBOL_PRESENT_vmap_pfn
+static int
+nv_dma_buf_vmap_pfns(
+    nv_dma_buf_file_private_t *priv,
+    pgprot_t page_prot,
+    void **vaddr
+)
+{
+    NvU32 i;
+    NvU64 range_index;
+    NvU64 pfn_index;
+    unsigned long *pfns;
+    NvU64 total_pfn_count = priv->total_size >> PAGE_SHIFT;
+    int ret = 0;
+
+    if (!PAGE_ALIGNED(priv->total_size))
+    {
+        nv_printf(NV_DBG_ERRORS,
+                  "NVRM: nv_dma_buf_vmap_pfns: priv->total_size[0x%llx] is not page aligned\n",
+                  priv->total_size);
+        return -EINVAL;
+    }
+
+    if (total_pfn_count > UINT_MAX)
+    {
+        nv_printf(NV_DBG_ERRORS,
+                  "NVRM: nv_dma_buf_vmap_pfns: total_pfn_count[0x%llx] exceeds UINT_MAX\n",
+                  total_pfn_count);
+        return -EOVERFLOW;
+    }
+
+    if (os_alloc_mem((void **)&pfns, total_pfn_count * sizeof(*pfns)) != NV_OK)
+    {
+        nv_printf(NV_DBG_ERRORS, "NVRM: nv_dma_buf_vmap_pfns: failed to allocate pfn array\n");
+        return -ENOMEM;
+    }
+
+    pfn_index = 0;
+    for (i = 0; i < priv->num_objects; i++)
+    {
+        MemoryArea *mem_area = &priv->handles[i].memArea;
+        for (range_index = 0; range_index < mem_area->numRanges; range_index++)
+        {
+            MemoryRange range = mem_area->pRanges[range_index];
+            NvU64 pfn;
+            NvU64 pfn_end;
+
+            if (!PAGE_ALIGNED(range.start) || !PAGE_ALIGNED(range.size))
+            {
+                nv_printf(NV_DBG_ERRORS,
+                          "NVRM: nv_dma_buf_vmap_pfns: a memory range is not page aligned start[%llx] size[%llx]\n",
+                          range.start, range.size);
+                ret = -EINVAL;
+                goto free_mem;
+            }
+
+            pfn     = range.start >> PAGE_SHIFT;
+            pfn_end = pfn + (range.size >> PAGE_SHIFT);
+            for (; pfn < pfn_end; pfn++)
+            {
+                if (pfn_index >= total_pfn_count)
+                {
+                    nv_printf(NV_DBG_ERRORS,
+                              "NVRM: nv_dma_buf_vmap_pfns: ranges cover more than the expected %llu pages\n",
+                              total_pfn_count);
+                    ret = -EINVAL;
+                    goto free_mem;
+                }
+
+                pfns[pfn_index++] = (unsigned long)pfn;
+            }
+        }
+    }
+
+    if (pfn_index != total_pfn_count)
+    {
+        nv_printf(NV_DBG_ERRORS,
+                  "NVRM: nv_dma_buf_vmap_pfns: ranges cover %llu pages, expected %llu\n",
+                  pfn_index, total_pfn_count);
+        ret = -EINVAL;
+        goto free_mem;
+    }
+
+    *vaddr = vmap_pfn(pfns, total_pfn_count, page_prot);
+    if (*vaddr == NULL)
+    {
+        nv_printf(NV_DBG_ERRORS, "NVRM: nv_dma_buf_vmap_pfns: vmap_pfn failed\n");
+        ret = -ENOMEM;
+        goto free_mem;
+    }
+
+free_mem:
+    os_free_mem(pfns);
+    return ret;
+}
+#else
+static int
+nv_dma_buf_vmap_pfns(
+    nv_dma_buf_file_private_t *priv,
+    pgprot_t page_prot,
+    void **vaddr
+)
+{
+    return -ENOTSUPP;
+}
+#endif // NV_IS_EXPORT_SYMBOL_PRESENT_vmap_pfn
+
+static int
+nv_dma_buf_vmap(
+    struct dma_buf *buf,
+    struct iosys_map *map
+)
+{
+    int ret = 0;
+    NV_STATUS status;
+    nv_dma_buf_file_private_t *priv = buf->priv;
+    pgprot_t page_prot;
+    void *vaddr;
+
+    if (priv == NULL)
+    {
+        nv_printf(NV_DBG_ERRORS, "NVRM: nv_dma_buf_vmap: priv == NULL.\n");
+        return -EINVAL;
+    }
+
+    mutex_lock(&priv->lock);
+
+    if (!priv->map_attrs.can_mmap)
+    {
+        nv_printf(NV_DBG_ERRORS,
+                  "NVRM: nv_dma_buf_vmap: vmap is not allowed can_mmap[%d] \n",
+                  priv->map_attrs.can_mmap);
+        ret = -ENOTSUPP;
+        goto unlock_priv;
+    }
+
+    if ((priv->num_objects != priv->total_objects) ||
+        (priv->attached_size != priv->total_size))
+    {
+        nv_printf(NV_DBG_ERRORS,
+                  "NVRM: nv_dma_buf_vmap: vmap of partially attached dma-buf is not supported\n");
+        ret = -EINVAL;
+        goto unlock_priv;
+    }
+
+    nv_printf(NV_DBG_INFO,
+              "NVRM: nv_dma_buf_vmap: os_page_size[%lx] total_size[%llx]\n",
+              PAGE_SIZE, priv->total_size);
+
+    //
+    // If the GPU has BAR1 < FB, it is possible that the allocation
+    // is not yet mapped to BAR1, if not already mapped for IO.
+    // So this needs to be done prior to vmap.
+    //
+    status = nv_dma_buf_get_phys_addresses(priv, 0, priv->num_objects);
+    if (status != NV_OK)
+    {
+        ret = -EIO;
+        goto unlock_priv;
+    }
+
+    // RO and cache type settings
+    page_prot = (priv->map_attrs.read_only_mem) ? PAGE_KERNEL_RO : PAGE_KERNEL;
+    if (!priv->map_attrs.mem_has_struct_page)
+    {
+        page_prot = nv_adjust_pgprot(page_prot);
+    }
+
+    if (nv_encode_caching(&page_prot,
+                          rm_disable_iomap_wc() ? NV_MEMORY_UNCACHED : priv->map_attrs.cache_type,
+                          priv->map_attrs.memory_type))
+    {
+        nv_printf(NV_DBG_ERRORS,
+                  "NVRM: [nv_dma_buf_vmap-failed] cache_type[%x] memory_type[%d] page_prot[%lx] \n",
+                  priv->map_attrs.cache_type, priv->map_attrs.memory_type, pgprot_val(page_prot));
+        ret = -ENXIO;
+        goto put_phys_addrs;
+    }
+
+    // Create kernel mapping
+    if (priv->map_attrs.mem_has_struct_page)
+    {
+        ret = nv_dma_buf_vmap_pages(priv, page_prot, &vaddr);
+        if (ret != 0)
+        {
+            goto put_phys_addrs;
+        }
+        iosys_map_set_vaddr(map, vaddr);
+    }
+    else
+    {
+        ret = nv_dma_buf_vmap_pfns(priv, page_prot, &vaddr);
+        if (ret != 0)
+        {
+            goto put_phys_addrs;
+        }
+        iosys_map_set_vaddr_iomem(map, (void __iomem *)vaddr);
+    }
+
+    mutex_unlock(&priv->lock);
+
+    return 0;
+
+put_phys_addrs:
+    nv_dma_buf_put_phys_addresses(priv, 0, priv->num_objects);
+
+unlock_priv:
+    mutex_unlock(&priv->lock);
+
+    return ret;
+}
+
+static void
+nv_dma_buf_vunmap(
+    struct dma_buf *buf,
+    struct iosys_map *map
+)
+{
+    nv_dma_buf_file_private_t *priv = buf->priv;
+
+    if (priv == NULL)
+    {
+        nv_printf(NV_DBG_ERRORS, "NVRM: nv_dma_buf_vunmap: priv == NULL.\n");
+        return;
+    }
+
+    mutex_lock(&priv->lock);
+
+    vunmap(map->is_iomem ? (void __force *)map->vaddr_iomem : map->vaddr);
+    nv_dma_buf_put_phys_addresses(priv, 0, priv->num_objects);
+
+    mutex_unlock(&priv->lock);
+}
+
 #if defined(NV_DMA_BUF_OPS_HAS_MAP)
 static void*
 nv_dma_buf_map_stub(
@@ -1568,6 +1917,8 @@ static const struct dma_buf_ops nv_dma_buf_ops = {
     .unmap_dma_buf = nv_dma_buf_unmap,
     .release       = nv_dma_buf_release,
     .mmap          = nv_dma_buf_mmap,
+    .vmap          = nv_dma_buf_vmap,
+    .vunmap        = nv_dma_buf_vunmap,
 #if defined(NV_DMA_BUF_OPS_HAS_MAP)
     .map          = nv_dma_buf_map_stub,
     .unmap        = nv_dma_buf_unmap_stub,
